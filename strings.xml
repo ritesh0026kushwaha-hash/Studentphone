@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">स्टूडेंट फोन</string>
+    <string name="accessibility_service_description">स्टूडेंट फोन को "कॉल काटो" बोलने पर कॉल खत्म/काटने में मदद करता है।</string>
+</resources>
