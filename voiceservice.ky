@@ -1,0 +1,185 @@
+package com.example.studentphone
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.telephony.PhoneStateListener
+import android.telephony.TelephonyCallback
+import android.telephony.TelephonyManager
+import android.util.Log
+import java.util.Locale
+
+class VoiceService : Service(), RecognitionListener {
+
+    private var recognizer: SpeechRecognizer? = null
+    private var processor: CommandProcessor? = null
+    private var retryRunnable: Runnable? = null
+    private lateinit var telephonyManager: TelephonyManager
+    private var phoneStateListener: PhoneStateListener? = null
+    private var telephonyCallback: TelephonyCallback? = null
+    private val handler = Handler(Looper.getMainLooper())
+
+    companion object {
+        private const val CHANNEL_ID = "voice_commands"
+        private const val NOTIF_ID = 1
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+        telephonyManager = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
+        processor = CommandProcessor(this)
+        recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        recognizer?.setRecognitionListener(this)
+        registerCallListener()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        try {
+            startForegroundCompat()
+        } catch (e: Exception) {
+            Log.e("VoiceService", "Foreground start failed", e)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        startListening()
+        return START_STICKY
+    }
+
+    private fun startForegroundCompat() {
+        val notification: Notification = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("स्टूडेंट फोन")
+            .setContentText("आपके वॉइस कमांड सुन रहा हूँ")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setOngoing(true)
+            .build()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        } else {
+            startForeground(NOTIF_ID, notification)
+        }
+    }
+
+    private fun startListening() {
+        try {
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "hi-IN")
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+            }
+            recognizer?.startListening(intent)
+        } catch (e: Exception) {
+            Log.e("VoiceService", "startListening failed", e)
+            scheduleRestart()
+        }
+    }
+
+    private fun scheduleRestart() {
+        retryRunnable?.let { handler.removeCallbacks(it) }
+        retryRunnable = Runnable { if (recognizer != null) startListening() }
+        handler.postDelayed(retryRunnable!!, 2000)
+    }
+
+    override fun onResults(results: Bundle?) {
+        val heard = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: ""
+        Log.d("VoiceService", "Heard: $heard")
+        runCommand(heard)
+        startListening()
+    }
+
+    private fun runCommand(raw: String) {
+        val text = raw.trim()
+        if (text.isEmpty()) return
+        val wake = getSharedPreferences("settings", MODE_PRIVATE)
+            .getString("wake_word", "")?.trim() ?: ""
+        val shouldRun = wake.isEmpty() || text.lowercase(Locale.getDefault())
+            .contains(wake.lowercase(Locale.getDefault()))
+        if (shouldRun) {
+            processor?.process(text)
+        }
+    }
+
+    override fun onError(error: Int) {
+        Log.e("VoiceService", "Recognition error: $error")
+        scheduleRestart()
+    }
+
+    private fun registerCallListener() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                telephonyCallback = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
+                    override fun onCallStateChanged(state: Int) {
+                        handleCallState(state)
+                    }
+                }
+                telephonyManager.registerTelephonyCallback(mainExecutor, telephonyCallback!!)
+            } else {
+                @Suppress("DEPRECATION")
+                phoneStateListener = object : PhoneStateListener() {
+                    @Suppress("DEPRECATION")
+                    override fun onCallStateChanged(state: Int, phoneNumber: String?) {
+                        handleCallState(state)
+                    }
+                }
+                @Suppress("DEPRECATION")
+                telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_CALL_STATE)
+            }
+        } catch (e: Exception) {
+            Log.e("VoiceService", "Call listener failed", e)
+        }
+    }
+
+    private fun handleCallState(state: Int) {
+        if (state == TelephonyManager.CALL_STATE_RINGING ||
+            state == TelephonyManager.CALL_STATE_OFFHOOK) {
+            Log.d("VoiceService", "Call in progress - listening for 'cut the call'")
+            processor?.speak("कॉल आ रही है। काटने के लिए बोलिए - कॉल काटो")
+            startListening()
+        }
+    }
+
+    override fun onDestroy() {
+        recognizer?.destroy()
+        recognizer = null
+        processor?.close()
+        processor = null
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                telephonyCallback?.let { telephonyManager.unregisterTelephonyCallback(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                phoneStateListener?.let { telephonyManager.listen(it, PhoneStateListener.LISTEN_NONE) }
+            }
+        } catch (e: Exception) { }
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onReadyForSpeech(params: Bundle?) {}
+    override fun onBeginningOfSpeech() {}
+    override fun onRmsChanged(rmsdB: Float) {}
+    override fun onBufferReceived(buffer: ByteArray?) {}
+    override fun onEndOfSpeech() {}
+    override fun onPartialResults(partialResults: Bundle?) {}
+
+    private fun createChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID, "वॉइस कमांड", NotificationManager.IMPORTANCE_LOW
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+}
